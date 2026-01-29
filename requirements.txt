@@ -1,4 +1,6 @@
-fastmcp==2.14.3
+# FastMCP v3 (beta) — required for AuthMiddleware / require_auth
+fastmcp>=3.0.0b0
+
 httpx
 python-dotenv
 uvicorn
