@@ -1,8 +1,7 @@
 import os
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, RedirectResponse
-from fastmcp import FastMCP
 from auth import token_manager
 from blackboard_client import BlackboardClient
 
@@ -11,28 +10,37 @@ load_dotenv()
 # Create FastAPI app for web routes
 app = FastAPI()
 
-# Create FastMCP server
+# Import the MCP instance
 from blackboard_mcp import mcp
 
-# Mount MCP at /mcp endpoint
-app.mount("/mcp", mcp.get_asgi_app())
+# Mount the MCP server correctly for FastMCP 2.x
+# Use the streamable_http_app() method instead of get_asgi_app()
+app.mount("/mcp", mcp.streamable_http_app())
 
-# OAuth routes
 @app.get("/")
 async def root():
+    """Health check endpoint"""
     return {
         "status": "ok",
         "server": "Blackboard MCP",
         "active_sessions": token_manager.get_session_count(),
+        "pending_auths": token_manager.get_pending_auth_count(),
         "mcp_endpoint": "/mcp"
     }
 
 @app.get("/auth/start")
 async def start_auth(session: str):
-    """Start Blackboard OAuth flow"""
+    """Start the Blackboard OAuth flow"""
     blackboard_url = os.getenv("BLACKBOARD_URL")
     app_key = os.getenv("BLACKBOARD_APP_KEY")
     server_url = os.getenv("SERVER_URL")
+    
+    if not all([blackboard_url, app_key, server_url]):
+        return HTMLResponse(
+            "<h1>❌ Server Configuration Error</h1>"
+            "<p>Missing required environment variables</p>",
+            status_code=500
+        )
     
     callback_url = f"{server_url}/auth/callback"
     
@@ -45,12 +53,15 @@ async def start_auth(session: str):
         f"&state={session}"
     )
     
+    print(f"🔗 Redirecting to Blackboard auth: {session[:16]}...")
     return RedirectResponse(url=auth_url)
 
 @app.get("/auth/callback")
 async def auth_callback(code: str, state: str):
     """Handle Blackboard OAuth callback"""
     auth_session_id = state
+    
+    print(f"📥 Received auth callback for session: {auth_session_id[:16]}...")
     
     try:
         blackboard_client = BlackboardClient(
@@ -70,6 +81,7 @@ async def auth_callback(code: str, state: str):
         <html>
             <head>
                 <title>✅ Authentication Successful</title>
+                <meta name="viewport" content="width=device-width, initial-scale=1">
                 <style>
                     body {{
                         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -86,18 +98,24 @@ async def auth_callback(code: str, state: str):
                         border-radius: 12px;
                         box-shadow: 0 10px 40px rgba(0,0,0,0.2);
                         max-width: 500px;
+                        width: 90%;
                         text-align: center;
                     }}
-                    h1 {{ color: #2d3748; margin-bottom: 20px; }}
+                    h1 {{
+                        color: #2d3748;
+                        margin-bottom: 20px;
+                        font-size: 24px;
+                    }}
                     .code {{
                         background: #f7fafc;
                         padding: 20px;
-                        font-size: 16px;
+                        font-size: 14px;
                         font-family: 'Courier New', monospace;
                         margin: 20px 0;
                         border-radius: 8px;
                         word-break: break-all;
                         border: 2px solid #e2e8f0;
+                        line-height: 1.5;
                     }}
                     button {{
                         background: #667eea;
@@ -108,12 +126,20 @@ async def auth_callback(code: str, state: str):
                         cursor: pointer;
                         font-size: 16px;
                         font-weight: 600;
+                        transition: background 0.2s;
                     }}
-                    button:hover {{ background: #5a67d8; }}
+                    button:hover {{
+                        background: #5a67d8;
+                    }}
                     .instructions {{
                         color: #4a5568;
                         margin: 20px 0;
                         line-height: 1.6;
+                    }}
+                    .note {{
+                        margin-top: 20px;
+                        color: #718096;
+                        font-size: 14px;
                     }}
                 </style>
             </head>
@@ -121,14 +147,15 @@ async def auth_callback(code: str, state: str):
                 <div class="container">
                     <h1>✅ Authentication Successful!</h1>
                     <div class="instructions">
-                        <p>Copy this code and paste it back to Claude:</p>
+                        <p><strong>Copy this code and paste it back to Claude:</strong></p>
                     </div>
                     <div class="code" id="code">{auth_session_id}</div>
                     <button onclick="copyCode()">📋 Copy Code</button>
-                    <p style="margin-top: 20px; color: #718096; font-size: 14px;">
+                    <div class="note">
                         You can close this window after copying the code.
-                    </p>
+                    </div>
                 </div>
+                
                 <script>
                     function copyCode() {{
                         const code = document.getElementById('code').textContent;
@@ -146,11 +173,55 @@ async def auth_callback(code: str, state: str):
         """)
         
     except Exception as e:
+        print(f"❌ Auth callback error: {str(e)}")
         return HTMLResponse(f"""
+        <!DOCTYPE html>
         <html>
-            <body style="font-family: Arial; padding: 50px; text-align: center;">
-                <h1>❌ Authentication Failed</h1>
-                <p>Error: {str(e)}</p>
+            <head>
+                <title>❌ Authentication Failed</title>
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <style>
+                    body {{
+                        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                        display: flex;
+                        justify-content: center;
+                        align-items: center;
+                        min-height: 100vh;
+                        margin: 0;
+                        background: #f7fafc;
+                    }}
+                    .container {{
+                        background: white;
+                        padding: 40px;
+                        border-radius: 12px;
+                        box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+                        max-width: 500px;
+                        width: 90%;
+                        text-align: center;
+                    }}
+                    h1 {{
+                        color: #e53e3e;
+                    }}
+                    .error {{
+                        background: #fff5f5;
+                        color: #c53030;
+                        padding: 20px;
+                        border-radius: 8px;
+                        margin: 20px 0;
+                        border: 1px solid #feb2b2;
+                        text-align: left;
+                        word-break: break-word;
+                    }}
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>❌ Authentication Failed</h1>
+                    <div class="error">
+                        <strong>Error:</strong><br>{str(e)}
+                    </div>
+                    <p>Please try again or contact support if the problem persists.</p>
+                </div>
             </body>
         </html>
         """, status_code=400)
