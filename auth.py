@@ -1,117 +1,97 @@
+"""
+Authentication for Blackboard MCP Server using FastMCP OAuthProxy
+Multi-tenant with persistent user identity from OAuth
+"""
 import os
-import json
-import secrets
-from datetime import datetime
-from cryptography.fernet import Fernet
-from typing import Optional, Dict
+import httpx
+import logging
+from typing import Optional
 
-class TokenManager:
-    """Manages encrypted storage of Blackboard tokens per MCP session"""
-    
-    def __init__(self):
-        key = os.getenv("TOKEN_ENCRYPTION_KEY")
-        if not key:
-            raise ValueError("TOKEN_ENCRYPTION_KEY environment variable must be set")
-        
-        self.cipher = Fernet(key.encode())
-        
-        # Session-based token storage: {mcp_session_id: encrypted_token}
-        # TODO: Replace with Redis or PostgreSQL for production
-        self._session_tokens: Dict[str, str] = {}
-        
-        # Temporary auth sessions for OAuth flow: {auth_session_id: session_data}
-        self._auth_sessions: Dict[str, dict] = {}
-        
-        print("✅ TokenManager initialized")
-    
-    def create_auth_session(self) -> str:
-        """
-        Create a temporary auth session for the OAuth flow.
-        Returns a unique session ID that the user will use to complete auth.
-        """
-        auth_session_id = secrets.token_urlsafe(32)
-        self._auth_sessions[auth_session_id] = {
-            "created_at": datetime.now(),
-            "token": None,
-            "status": "pending"
-        }
-        print(f"🔑 Created auth session: {auth_session_id[:16]}...")
-        return auth_session_id
-    
-    async def store_auth_token(self, auth_session_id: str, blackboard_token: dict):
-        """
-        Store the Blackboard token in a temporary auth session.
-        This is called after the user logs into Blackboard.
-        """
-        if auth_session_id not in self._auth_sessions:
-            raise ValueError(f"Invalid auth session ID: {auth_session_id[:16]}...")
-        
-        self._auth_sessions[auth_session_id]["token"] = blackboard_token
-        self._auth_sessions[auth_session_id]["status"] = "completed"
-        print(f"💾 Stored Blackboard token in auth session: {auth_session_id[:16]}...")
-    
-    async def link_to_mcp_session(self, auth_session_id: str, mcp_session_id: str) -> bool:
-        """
-        Link a completed auth session to an MCP session.
-        This associates the Blackboard token with the user's MCP session.
-        """
-        if auth_session_id not in self._auth_sessions:
-            print(f"❌ Auth session not found: {auth_session_id[:16]}...")
-            return False
-        
-        auth_session = self._auth_sessions[auth_session_id]
-        
-        if auth_session["status"] != "completed" or not auth_session["token"]:
-            print(f"❌ Auth session not completed: {auth_session_id[:16]}...")
-            return False
-        
-        # Encrypt the token
-        token_json = json.dumps(auth_session["token"])
-        encrypted = self.cipher.encrypt(token_json.encode())
-        
-        # Store encrypted token for this MCP session
-        self._session_tokens[mcp_session_id] = encrypted.decode()
-        
-        # Clean up the temporary auth session
-        del self._auth_sessions[auth_session_id]
-        
-        print(f"✅ Linked Blackboard token to MCP session: {mcp_session_id[:16]}...")
-        return True
-    
-    async def get_token(self, mcp_session_id: str) -> Optional[dict]:
-        """
-        Retrieve the Blackboard token for an MCP session.
-        Returns None if no token is stored for this session.
-        """
-        if not mcp_session_id:
-            print("❌ No MCP session ID provided")
-            return None
-        
-        encrypted = self._session_tokens.get(mcp_session_id)
-        
-        if not encrypted:
-            print(f"⚠️ No token found for session: {mcp_session_id[:16]}...")
-            return None
-        
-        # Decrypt the token
-        decrypted = self.cipher.decrypt(encrypted.encode())
-        token = json.loads(decrypted)
-        print(f"🔓 Retrieved token for session: {mcp_session_id[:16]}...")
-        return token
-    
-    async def delete_token(self, mcp_session_id: str):
-        """Remove the Blackboard token for an MCP session"""
-        if mcp_session_id in self._session_tokens:
-            del self._session_tokens[mcp_session_id]
-            print(f"🗑️ Deleted token for session: {mcp_session_id[:16]}...")
-    
-    def get_session_count(self) -> int:
-        """Get the number of active sessions (for monitoring)"""
-        return len(self._session_tokens)
-    
-    def get_pending_auth_count(self) -> int:
-        """Get the number of pending auth sessions (for monitoring)"""
-        return len(self._auth_sessions)
+logger = logging.getLogger(__name__)
 
-# Global token manager instance
-token_manager = TokenManager()
+# Configuration
+BLACKBOARD_URL = os.environ.get("BLACKBOARD_URL")
+BLACKBOARD_APP_KEY = os.environ.get("BLACKBOARD_APP_KEY")
+BLACKBOARD_APP_SECRET = os.environ.get("BLACKBOARD_APP_SECRET")
+SERVER_URL = os.environ.get("SERVER_URL")
+
+if not all([BLACKBOARD_URL, BLACKBOARD_APP_KEY, BLACKBOARD_APP_SECRET, SERVER_URL]):
+    raise EnvironmentError("Missing required environment variables")
+
+from fastmcp.server.auth import OAuthProxy
+from fastmcp.server.auth.verifiers import TokenVerifier
+
+class BlackboardTokenVerifier(TokenVerifier):
+    """
+    Verifies Blackboard tokens and extracts user identity.
+    The 'sub' claim becomes the stable user identifier for multi-tenancy.
+    """
+    
+    def __init__(self, blackboard_url: str):
+        self.blackboard_url = blackboard_url.rstrip("/")
+    
+    @property
+    def issuer(self) -> str:
+        return self.blackboard_url
+    
+    @property
+    def required_scopes(self) -> list[str]:
+        return ["read", "write", "offline"]
+    
+    async def verify_token(self, token: str) -> Optional[dict]:
+        """
+        Verify token by calling Blackboard API and extract user identity.
+        Returns claims dict with 'sub' as the unique user identifier.
+        """
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"{self.blackboard_url}/learn/api/public/v1/users/me",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=10.0
+                )
+                
+                if response.status_code == 200:
+                    user_data = response.json()
+                    
+                    # Extract Blackboard user ID - this is the stable identifier
+                    blackboard_user_id = user_data.get("id")  # e.g., "_12345_1"
+                    
+                    name_parts = user_data.get("name", {})
+                    full_name = f"{name_parts.get('given', '')} {name_parts.get('family', '')}".strip()
+                    
+                    logger.info(f"✅ Token verified for Blackboard user: {blackboard_user_id}")
+                    
+                    # Return OAuth claims - 'sub' is the standard user identifier
+                    return {
+                        "sub": blackboard_user_id,  # PRIMARY USER IDENTIFIER
+                        "name": full_name or user_data.get("userName"),
+                        "email": user_data.get("contact", {}).get("email"),
+                        "userName": user_data.get("userName"),
+                        "scopes": ["read", "write", "offline"],
+                    }
+                
+                logger.warning(f"Token verification failed: HTTP {response.status_code}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Token verification error: {e}")
+            return None
+
+# Create token verifier
+token_verifier = BlackboardTokenVerifier(blackboard_url=BLACKBOARD_URL)
+
+# Create OAuthProxy - handles all OAuth flow automatically
+auth = OAuthProxy(
+    upstream_authorization_endpoint=f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/authorizationcode",
+    upstream_token_endpoint=f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/token",
+    upstream_client_id=BLACKBOARD_APP_KEY,
+    upstream_client_secret=BLACKBOARD_APP_SECRET,
+    token_verifier=token_verifier,
+    base_url=SERVER_URL,
+    token_endpoint_auth_method="client_secret_basic",
+    forward_pkce=True,
+    require_authorization_consent=True,
+)
+
+logger.info("✅ OAuthProxy configured for Blackboard with user identity extraction")
