@@ -1,6 +1,4 @@
 fastmcp
-mcp
 httpx
-cryptography
 python-dotenv
 uvicorn
