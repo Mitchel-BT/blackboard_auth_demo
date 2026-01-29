@@ -18,8 +18,9 @@ SERVER_URL = os.environ.get("SERVER_URL")
 if not all([BLACKBOARD_URL, BLACKBOARD_APP_KEY, BLACKBOARD_APP_SECRET, SERVER_URL]):
     raise EnvironmentError("Missing required environment variables")
 
+# Import from MCP SDK (not fastmcp) for base classes
+from mcp.server.auth.provider import AccessToken, TokenVerifier
 from fastmcp.server.auth import OAuthProxy
-from fastmcp.server.auth.providers.bearer import TokenVerifier, AccessToken
 
 
 class BlackboardTokenVerifier(TokenVerifier):
@@ -34,7 +35,7 @@ class BlackboardTokenVerifier(TokenVerifier):
     async def verify_token(self, token: str) -> Optional[AccessToken]:
         """
         Verify token by calling Blackboard API and extract user identity.
-        Returns AccessToken with user identity claims.
+        Returns AccessToken with user identity.
         """
         try:
             async with httpx.AsyncClient() as client:
@@ -55,17 +56,11 @@ class BlackboardTokenVerifier(TokenVerifier):
                     
                     logger.info(f"✅ Token verified for Blackboard user: {blackboard_user_id}")
                     
-                    # Return AccessToken object instead of dict
+                    # Return AccessToken object
                     return AccessToken(
                         token=token,
                         client_id=blackboard_user_id,  # PRIMARY USER IDENTIFIER
                         scopes=["read", "write", "offline"],
-                        claims={
-                            "sub": blackboard_user_id,
-                            "name": full_name or user_data.get("userName"),
-                            "email": user_data.get("contact", {}).get("email"),
-                            "userName": user_data.get("userName"),
-                        }
                     )
                 
                 logger.warning(f"Token verification failed: HTTP {response.status_code}")
