@@ -37,7 +37,6 @@ class BlackboardTokenVerifier(TokenVerifier):
 
     def __init__(self, blackboard_url: str, required_scopes: Sequence[str] = ()):
         self.blackboard_url = blackboard_url.rstrip("/")
-        # ✅ FastMCP OAuthProxy expects this attribute to exist
         self.required_scopes: list[str] = list(required_scopes)
 
     async def verify_token(self, token: str) -> Optional[AccessToken]:
@@ -62,13 +61,12 @@ class BlackboardTokenVerifier(TokenVerifier):
 
             logger.info("✅ Token verified for Blackboard user: %s", blackboard_user_id)
 
-            # If you want FastMCP to enforce scopes, return the actual scopes granted
-            # (If Blackboard doesn't return scopes reliably, you can keep your fixed list,
-            # but enforcement may be misleading.)
+            # IMPORTANT: include claims with a stable subject identifier.
             return AccessToken(
                 token=token,
                 client_id=blackboard_user_id,
-                scopes=self.required_scopes,  # or parse from token/provider if available
+                scopes=self.required_scopes,
+                claims={"sub": blackboard_user_id},
             )
 
         except Exception as e:
@@ -76,12 +74,11 @@ class BlackboardTokenVerifier(TokenVerifier):
             return None
 
 
-# Optional: configure required scopes from env so you don't hardcode guesses
 BLACKBOARD_SCOPES = _parse_scopes(os.environ.get("BLACKBOARD_SCOPES"))
 
 token_verifier = BlackboardTokenVerifier(
     blackboard_url=BLACKBOARD_URL,
-    required_scopes=BLACKBOARD_SCOPES,  # defaults to [] if env var not set
+    required_scopes=BLACKBOARD_SCOPES,
 )
 
 auth = OAuthProxy(
