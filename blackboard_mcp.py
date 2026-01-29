@@ -1,12 +1,10 @@
 """
-Blackboard MCP Tools (ChatGPT + Claude + FastMCP Cloud)
+Blackboard MCP Tools (FastMCP Cloud + Claude + ChatGPT)
 
-Key goals:
-- Initialize must succeed without requiring a token (no 401 on initialize).
-- OAuth is handled by OAuthProxy, but tools require auth to be visible/callable.
-- Force OpenAI tool visibility meta at emission time.
-
-FastMCP Cloud entrypoint should be: blackboard_mcp.py:mcp
+Behavior:
+- Tools are always visible (tools/list allowed without auth).
+- Using tools requires login (tools/call requires a valid token).
+- Force OpenAI tool visibility metadata at emission time.
 """
 
 import os
@@ -15,8 +13,7 @@ from dotenv import load_dotenv
 
 from fastmcp import FastMCP, Context
 from fastmcp.server.dependencies import get_access_token
-from fastmcp.server.middleware import Middleware, AuthMiddleware
-from fastmcp.server.auth import require_auth
+from fastmcp.server.middleware import Middleware
 
 from blackboard_client import BlackboardClient
 from auth import auth
@@ -30,27 +27,20 @@ OPENAI_PUBLIC_META = {
     "openai/widgetAccessible": True,
 }
 
-# Create FastMCP server with OAuth proxy AND enforced authorization for tools/resources/prompts.
-# AuthMiddleware enforces authorization (blocks execution) and filters list responses. :contentReference[oaicite:3]{index=3}
-mcp = FastMCP(
-    "Blackboard",
-    auth=auth,
-    middleware=[
-        AuthMiddleware(auth=require_auth),
-    ],
-)
+# ✅ IMPORTANT: No AuthMiddleware(require_auth) here.
+# That middleware hides tools pre-login. We want tools visible, but calls gated.
+mcp = FastMCP("Blackboard", auth=auth)
 
 
 class ForceOpenAIPublicTools(Middleware):
     """
-    Ensure all tools emitted by list_tools have OpenAI visibility set to public.
-    This is a last-mile emission control layer.
+    Last-mile emission control: ensure tools are visible to OpenAI ChatGPT
+    by setting tool.meta keys that become MCP tool descriptor `_meta`.
     """
 
     async def on_list_tools(self, context, call_next):
         tools = await call_next(context)
 
-        # tools is typically a sequence of Tool objects in FastMCP middleware
         if isinstance(tools, (list, tuple)):
             for t in tools:
                 meta = getattr(t, "meta", None)
@@ -63,13 +53,35 @@ class ForceOpenAIPublicTools(Middleware):
         return tools
 
 
-# Add emission-control middleware
+class RequireAuthOnToolCall(Middleware):
+    """
+    Allow handshake + discovery unauthenticated.
+    Require authentication only when a tool is actually called.
+    """
+
+    async def on_call_tool(self, context, call_next):
+        # When a tool is called, require access token to be present & valid.
+        try:
+            token_obj = get_access_token()
+        except Exception:
+            token_obj = None
+
+        if not token_obj:
+            # Return a user-facing error. The client should prompt OAuth.
+            # (Raising PermissionError typically maps to a tool-call error response.)
+            raise PermissionError("Login required. Please connect your Blackboard account and try again.")
+
+        return await call_next(context)
+
+
+# Register middleware at import time (FastMCP Cloud will import this module)
 mcp.add_middleware(ForceOpenAIPublicTools())
+mcp.add_middleware(RequireAuthOnToolCall())
 
 
 def _get_oauth_access_token_str() -> str:
     """
-    Extract an OAuth access token string from FastMCP's get_access_token().
+    Extract access token string from FastMCP get_access_token() object.
     """
     token_obj = get_access_token()
     if token_obj is None:
@@ -93,6 +105,7 @@ def _get_oauth_access_token_str() -> str:
 def get_user_id(ctx: Context) -> str:
     """
     Stable user identifier from token claims where available.
+    Falls back to session_id if unauthenticated.
     """
     try:
         token = get_access_token()
@@ -113,10 +126,6 @@ def _client() -> BlackboardClient:
         app_secret=os.getenv("BLACKBOARD_APP_SECRET"),
     )
 
-
-# NOTE:
-# We keep meta=OPENAI_PUBLIC_META for static declaration and ALSO have middleware forcing it at list time.
-# Tools are protected by AuthMiddleware(require_auth) so they will appear only after OAuth. :contentReference[oaicite:4]{index=4}
 
 @mcp.tool(meta=OPENAI_PUBLIC_META, annotations={"readOnlyHint": True})
 async def get_my_courses(ctx: Context) -> str:
