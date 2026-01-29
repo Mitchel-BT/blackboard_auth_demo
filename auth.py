@@ -1,15 +1,10 @@
-"""
-Authentication for Blackboard MCP Server using FastMCP OAuthProxy
-Multi-tenant with persistent user identity from OAuth
-"""
 import os
 import httpx
 import logging
-from typing import Optional
+from typing import Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
-# Configuration
 BLACKBOARD_URL = os.environ.get("BLACKBOARD_URL")
 BLACKBOARD_APP_KEY = os.environ.get("BLACKBOARD_APP_KEY")
 BLACKBOARD_APP_SECRET = os.environ.get("BLACKBOARD_APP_SECRET")
@@ -18,63 +13,77 @@ SERVER_URL = os.environ.get("SERVER_URL")
 if not all([BLACKBOARD_URL, BLACKBOARD_APP_KEY, BLACKBOARD_APP_SECRET, SERVER_URL]):
     raise EnvironmentError("Missing required environment variables")
 
-# Import from MCP SDK (not fastmcp) for base classes
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from fastmcp.server.auth import OAuthProxy
+
+
+def _parse_scopes(env_value: str | None) -> list[str]:
+    """
+    Supports either space-separated or comma-separated scopes.
+    Examples:
+      "read write offline"
+      "read,write,offline"
+    """
+    if not env_value:
+        return []
+    raw = env_value.replace(",", " ").split()
+    return [s.strip() for s in raw if s.strip()]
 
 
 class BlackboardTokenVerifier(TokenVerifier):
     """
     Verifies Blackboard tokens and extracts user identity.
-    The 'sub' claim becomes the stable user identifier for multi-tenancy.
     """
-    
-    def __init__(self, blackboard_url: str):
+
+    def __init__(self, blackboard_url: str, required_scopes: Sequence[str] = ()):
         self.blackboard_url = blackboard_url.rstrip("/")
-    
+        # ✅ FastMCP OAuthProxy expects this attribute to exist
+        self.required_scopes: list[str] = list(required_scopes)
+
     async def verify_token(self, token: str) -> Optional[AccessToken]:
-        """
-        Verify token by calling Blackboard API and extract user identity.
-        Returns AccessToken with user identity.
-        """
         try:
             async with httpx.AsyncClient() as client:
-                response = await client.get(
+                resp = await client.get(
                     f"{self.blackboard_url}/learn/api/public/v1/users/me",
                     headers={"Authorization": f"Bearer {token}"},
-                    timeout=10.0
+                    timeout=10.0,
                 )
-                
-                if response.status_code == 200:
-                    user_data = response.json()
-                    
-                    # Extract Blackboard user ID - this is the stable identifier
-                    blackboard_user_id = user_data.get("id")  # e.g., "_12345_1"
-                    
-                    name_parts = user_data.get("name", {})
-                    full_name = f"{name_parts.get('given', '')} {name_parts.get('family', '')}".strip()
-                    
-                    logger.info(f"✅ Token verified for Blackboard user: {blackboard_user_id}")
-                    
-                    # Return AccessToken object
-                    return AccessToken(
-                        token=token,
-                        client_id=blackboard_user_id,  # PRIMARY USER IDENTIFIER
-                        scopes=["read", "write", "offline"],
-                    )
-                
-                logger.warning(f"Token verification failed: HTTP {response.status_code}")
+
+            if resp.status_code != 200:
+                logger.warning("Token verification failed: HTTP %s", resp.status_code)
                 return None
-                
+
+            user_data = resp.json()
+            blackboard_user_id = user_data.get("id")  # e.g., "_12345_1"
+
+            if not blackboard_user_id:
+                logger.warning("Token verified but no user id returned from /users/me")
+                return None
+
+            logger.info("✅ Token verified for Blackboard user: %s", blackboard_user_id)
+
+            # If you want FastMCP to enforce scopes, return the actual scopes granted
+            # (If Blackboard doesn't return scopes reliably, you can keep your fixed list,
+            # but enforcement may be misleading.)
+            return AccessToken(
+                token=token,
+                client_id=blackboard_user_id,
+                scopes=self.required_scopes,  # or parse from token/provider if available
+            )
+
         except Exception as e:
-            logger.error(f"Token verification error: {e}")
+            logger.error("Token verification error: %s", e)
             return None
 
 
-# Create token verifier
-token_verifier = BlackboardTokenVerifier(blackboard_url=BLACKBOARD_URL)
+# Optional: configure required scopes from env so you don't hardcode guesses
+BLACKBOARD_SCOPES = _parse_scopes(os.environ.get("BLACKBOARD_SCOPES"))
 
-# Create OAuthProxy - handles all OAuth flow automatically
+token_verifier = BlackboardTokenVerifier(
+    blackboard_url=BLACKBOARD_URL,
+    required_scopes=BLACKBOARD_SCOPES,  # defaults to [] if env var not set
+)
+
 auth = OAuthProxy(
     upstream_authorization_endpoint=f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/authorizationcode",
     upstream_token_endpoint=f"{BLACKBOARD_URL}/learn/api/public/v1/oauth2/token",
