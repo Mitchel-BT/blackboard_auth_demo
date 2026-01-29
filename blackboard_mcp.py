@@ -1,10 +1,10 @@
 """
 Blackboard MCP Tools with multi-tenant user identity (ChatGPT-friendly)
 
-Key changes vs your version:
-- Do NOT accept `access_token` as a tool parameter (ChatGPT may hide such tools).
+Key changes vs original:
+- DO NOT accept `access_token` as a tool parameter (ChatGPT may hide these tools).
 - Pull the access token from FastMCP auth via get_access_token().
-- Mark tools as public via tags and enable only those tags.
+- NO mcp.enable(...) (your FastMCP version doesn't have it).
 """
 
 import os
@@ -12,7 +12,7 @@ import logging
 from dotenv import load_dotenv
 
 from fastmcp import FastMCP, Context
-from fastmcp.server.dependencies import get_access_token  # returns AccessToken-like object
+from fastmcp.server.dependencies import get_access_token
 
 from blackboard_client import BlackboardClient
 from auth import auth
@@ -26,33 +26,36 @@ mcp = FastMCP("Blackboard", auth=auth)
 
 def _get_oauth_access_token_str() -> str:
     """
-    Returns the OAuth access token string from FastMCP's dependency.
-    Different FastMCP versions name the field differently, so we try common ones.
+    Extract an OAuth access token string from FastMCP's get_access_token().
+
+    FastMCP versions differ in attribute naming, so try several common forms.
     """
     token_obj = get_access_token()
 
-    # Try common attribute names
+    # Common attribute names across versions
     for attr in ("token", "access_token", "value"):
-        if hasattr(token_obj, attr):
-            val = getattr(token_obj, attr)
-            if isinstance(val, str) and val:
-                return val
+        val = getattr(token_obj, attr, None)
+        if isinstance(val, str) and val:
+            return val
 
-    # As a last resort, try dict-like access
+    # Some versions may return a dict-like object
     try:
-        val = token_obj["access_token"]
+        val = token_obj.get("access_token")  # type: ignore[attr-defined]
         if isinstance(val, str) and val:
             return val
     except Exception:
         pass
 
-    raise RuntimeError("Could not extract access token string from get_access_token().")
+    raise RuntimeError(
+        "Could not extract access token string from get_access_token(). "
+        "Inspect the AccessToken object to determine the correct attribute."
+    )
 
 
 def get_user_id(ctx: Context) -> str:
     """
     Get the stable user identifier from OAuth token claims.
-    Uses get_access_token() which returns an AccessToken-ish object with .claims
+    Uses get_access_token() which returns an object with .claims on most versions.
     """
     try:
         token = get_access_token()
@@ -64,11 +67,11 @@ def get_user_id(ctx: Context) -> str:
             return user_id
 
         logger.warning("No 'sub' claim found in token claims")
-        return ctx.session_id if ctx and ctx.session_id else "unknown"
+        return ctx.session_id if ctx and getattr(ctx, "session_id", None) else "unknown"
 
     except Exception as e:
         logger.error("Error getting user ID from token: %s", e)
-        return ctx.session_id if ctx and ctx.session_id else "unknown"
+        return ctx.session_id if ctx and getattr(ctx, "session_id", None) else "unknown"
 
 
 def _client() -> BlackboardClient:
@@ -79,15 +82,11 @@ def _client() -> BlackboardClient:
     )
 
 
-# -------------------------
-# PUBLIC TOOLS (ChatGPT can use these)
-# -------------------------
-
-@mcp.tool(tags={"public"}, annotations={"readOnlyHint": True})
+@mcp.tool()
 async def get_my_courses(ctx: Context) -> str:
     """
     Get all your enrolled Blackboard courses.
-    Auth happens via the connected OAuth session (no token argument needed).
+    Authentication happens via the connected OAuth session.
     """
     user_id = get_user_id(ctx)
     logger.info("get_my_courses called by user: %s", user_id)
@@ -110,7 +109,7 @@ async def get_my_courses(ctx: Context) -> str:
         return f"❌ Error fetching courses: {str(e)}"
 
 
-@mcp.tool(tags={"public"}, annotations={"readOnlyHint": True})
+@mcp.tool()
 async def get_my_grades(ctx: Context, course_id: str) -> str:
     """
     Get your grades for a specific course.
@@ -139,7 +138,7 @@ async def get_my_grades(ctx: Context, course_id: str) -> str:
         return f"❌ Error fetching grades: {str(e)}"
 
 
-@mcp.tool(tags={"public"}, annotations={"readOnlyHint": True})
+@mcp.tool()
 async def get_course_announcements(ctx: Context, course_id: str) -> str:
     """
     Get announcements for a specific course.
@@ -148,7 +147,7 @@ async def get_course_announcements(ctx: Context, course_id: str) -> str:
         course_id: The Blackboard course ID
     """
     user_id = get_user_id(ctx)
-    logger.info("get_course_announcements called by user: %s course: %s", user_id, course_id)
+    logger.info("get_course_announcements called by user: %s for course: %s", user_id, course_id)
 
     try:
         access_token = _get_oauth_access_token_str()
@@ -170,34 +169,30 @@ async def get_course_announcements(ctx: Context, course_id: str) -> str:
         return f"❌ Error fetching announcements: {str(e)}"
 
 
-# -------------------------
-# NON-PUBLIC TOOL (you can flip to public if you want)
-# -------------------------
-
-@mcp.tool(tags={"internal"}, annotations={"readOnlyHint": True})
+@mcp.tool()
 async def debug_identity(ctx: Context) -> str:
     """
     Debug authentication and identity information.
     Shows the stable user ID used for multi-tenancy.
     """
     user_id = get_user_id(ctx)
-    session_id = ctx.session_id if ctx else None
+    session_id = getattr(ctx, "session_id", None)
 
+    # Claims
     try:
         token = get_access_token()
         claims = dict(getattr(token, "claims", {}) or {})
-        claims_list = [f"  {k}: {v}" for k, v in claims.items()]
-        claims_info = "\n".join(claims_list) if claims_list else "  (no claims available)"
+        claims_lines = "\n".join([f"  {k}: {v}" for k, v in claims.items()]) or "  (no claims available)"
     except Exception as e:
-        claims_info = f"Error getting claims: {e}"
+        claims_lines = f"  Error getting claims: {e}"
 
-    # Access token preview (never print the whole token)
+    # Token preview
     try:
         access_token = _get_oauth_access_token_str()
         token_preview = f"{access_token[:8]}..."
         has_token = True
-    except Exception:
-        token_preview = "None..."
+    except Exception as e:
+        token_preview = f"None... ({e})"
         has_token = False
 
     return f"""🔍 **Identity & Authentication Debug**
@@ -209,7 +204,7 @@ MCP SESSION (may change between conversations):
   Session ID: {session_id[:16] if session_id else 'None'}...
 
 OAUTH CLAIMS (from token.claims):
-{claims_info}
+{claims_lines}
 
 ACCESS TOKEN:
   Has Token: {has_token}
@@ -217,7 +212,3 @@ ACCESS TOKEN:
 
 💡 The Blackboard User ID (from claims['sub']) is your stable identifier.
 """
-
-
-# Make ONLY public-tagged tools visible/usable in ChatGPT
-mcp.enable(tags={"public"}, only=True)
