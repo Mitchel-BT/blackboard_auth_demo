@@ -1,14 +1,16 @@
 """
-Blackboard MCP Tools with multi-tenant user identity (ChatGPT-friendly)
+Blackboard MCP Tools with multi-tenant user identity (Claude + OpenAI compatible)
 
-Key changes vs original:
-- DO NOT accept `access_token` as a tool parameter (ChatGPT may hide these tools).
-- Pull the access token from FastMCP auth via get_access_token().
-- NO mcp.enable(...) (your FastMCP version doesn't have it).
+- No access_token tool parameters.
+- Pull OAuth token via get_access_token().
+- Mark tools as public for OpenAI when supported via tool meta:
+    {"openai/visibility": "public"}
+- Works even on older FastMCP versions that don't support meta/tags/annotations.
 """
 
 import os
 import logging
+import inspect
 from dotenv import load_dotenv
 
 from fastmcp import FastMCP, Context
@@ -20,25 +22,51 @@ from auth import auth
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-# Create FastMCP with OAuth
 mcp = FastMCP("Blackboard", auth=auth)
+
+OPENAI_PUBLIC_META = {"openai/visibility": "public"}
+OPENAI_PRIVATE_META = {"openai/visibility": "private"}
+
+
+def _mcp_tool_kwargs(*, public: bool = True, read_only: bool = True) -> dict:
+    """
+    Build kwargs for @mcp.tool(...) in a version-tolerant way.
+    Older FastMCP versions may not accept meta=/tags=/annotations=.
+    """
+    sig = inspect.signature(mcp.tool)
+    params = sig.parameters
+
+    kwargs = {}
+
+    if "annotations" in params and read_only:
+        kwargs["annotations"] = {"readOnlyHint": True}
+
+    if "tags" in params:
+        kwargs["tags"] = {"public"} if public else {"internal"}
+
+    # OpenAI uses this for tool visibility in ChatGPT
+    if "meta" in params:
+        kwargs["meta"] = OPENAI_PUBLIC_META if public else OPENAI_PRIVATE_META
+
+    return kwargs
+
+
+def public_tool(*, read_only: bool = True):
+    return mcp.tool(**_mcp_tool_kwargs(public=True, read_only=read_only))
+
+
+def internal_tool(*, read_only: bool = True):
+    return mcp.tool(**_mcp_tool_kwargs(public=False, read_only=read_only))
 
 
 def _get_oauth_access_token_str() -> str:
-    """
-    Extract an OAuth access token string from FastMCP's get_access_token().
-
-    FastMCP versions differ in attribute naming, so try several common forms.
-    """
     token_obj = get_access_token()
 
-    # Common attribute names across versions
     for attr in ("token", "access_token", "value"):
         val = getattr(token_obj, attr, None)
         if isinstance(val, str) and val:
             return val
 
-    # Some versions may return a dict-like object
     try:
         val = token_obj.get("access_token")  # type: ignore[attr-defined]
         if isinstance(val, str) and val:
@@ -53,10 +81,6 @@ def _get_oauth_access_token_str() -> str:
 
 
 def get_user_id(ctx: Context) -> str:
-    """
-    Get the stable user identifier from OAuth token claims.
-    Uses get_access_token() which returns an object with .claims on most versions.
-    """
     try:
         token = get_access_token()
         claims = getattr(token, "claims", {}) or {}
@@ -82,12 +106,8 @@ def _client() -> BlackboardClient:
     )
 
 
-@mcp.tool()
+@public_tool(read_only=True)
 async def get_my_courses(ctx: Context) -> str:
-    """
-    Get all your enrolled Blackboard courses.
-    Authentication happens via the connected OAuth session.
-    """
     user_id = get_user_id(ctx)
     logger.info("get_my_courses called by user: %s", user_id)
 
@@ -109,14 +129,8 @@ async def get_my_courses(ctx: Context) -> str:
         return f"❌ Error fetching courses: {str(e)}"
 
 
-@mcp.tool()
+@public_tool(read_only=True)
 async def get_my_grades(ctx: Context, course_id: str) -> str:
-    """
-    Get your grades for a specific course.
-
-    Args:
-        course_id: The Blackboard course ID
-    """
     user_id = get_user_id(ctx)
     logger.info("get_my_grades called by user: %s for course: %s", user_id, course_id)
 
@@ -138,14 +152,8 @@ async def get_my_grades(ctx: Context, course_id: str) -> str:
         return f"❌ Error fetching grades: {str(e)}"
 
 
-@mcp.tool()
+@public_tool(read_only=True)
 async def get_course_announcements(ctx: Context, course_id: str) -> str:
-    """
-    Get announcements for a specific course.
-
-    Args:
-        course_id: The Blackboard course ID
-    """
     user_id = get_user_id(ctx)
     logger.info("get_course_announcements called by user: %s for course: %s", user_id, course_id)
 
@@ -169,16 +177,12 @@ async def get_course_announcements(ctx: Context, course_id: str) -> str:
         return f"❌ Error fetching announcements: {str(e)}"
 
 
-@mcp.tool()
+# ✅ NOW PUBLIC
+@public_tool(read_only=True)
 async def debug_identity(ctx: Context) -> str:
-    """
-    Debug authentication and identity information.
-    Shows the stable user ID used for multi-tenancy.
-    """
     user_id = get_user_id(ctx)
     session_id = getattr(ctx, "session_id", None)
 
-    # Claims
     try:
         token = get_access_token()
         claims = dict(getattr(token, "claims", {}) or {})
@@ -186,7 +190,6 @@ async def debug_identity(ctx: Context) -> str:
     except Exception as e:
         claims_lines = f"  Error getting claims: {e}"
 
-    # Token preview
     try:
         access_token = _get_oauth_access_token_str()
         token_preview = f"{access_token[:8]}..."
@@ -209,6 +212,4 @@ OAUTH CLAIMS (from token.claims):
 ACCESS TOKEN:
   Has Token: {has_token}
   Token Preview: {token_preview}
-
-💡 The Blackboard User ID (from claims['sub']) is your stable identifier.
 """
