@@ -3,8 +3,9 @@ Blackboard MCP Tools with multi-tenant user identity (Claude + OpenAI compatible
 
 - No access_token tool parameters.
 - Pull OAuth token via get_access_token().
-- Explicitly mark tools public for OpenAI via tool _meta:
-    {"openai/visibility": "public"}
+- Force tools to be visible in OpenAI ChatGPT by injecting:
+    _meta.openai/visibility = "public"
+into the tools list response (FastMCP Cloud-safe).
 """
 
 import os
@@ -14,6 +15,9 @@ from dotenv import load_dotenv
 from fastmcp import FastMCP, Context
 from fastmcp.server.dependencies import get_access_token
 
+# ✅ FastMCP middleware (Cloud runs this at import time)
+from fastmcp.server.middleware import Middleware
+
 from blackboard_client import BlackboardClient
 from auth import auth
 
@@ -22,21 +26,68 @@ logger = logging.getLogger(__name__)
 
 mcp = FastMCP("Blackboard", auth=auth)
 
-# OpenAI tool visibility lives on the tool descriptor _meta.
-# FastMCP exposes this as the `meta=` parameter on @mcp.tool(...). :contentReference[oaicite:2]{index=2}
-OPENAI_PUBLIC_META = {"openai/visibility": "public"}
+# OpenAI tool visibility lives on the tool descriptor _meta
+OPENAI_PUBLIC_META = {
+    "openai/visibility": "public",
+    # optional extra hint; harmless for Claude
+    "openai/widgetAccessible": True,
+}
+
+
+class ForceOpenAIPublicTools(Middleware):
+    """
+    Forces all tools to be visible to ChatGPT by rewriting tool descriptors
+    returned by tools/list so each has `_meta.openai/visibility = "public"`.
+    """
+
+    async def on_list_tools(self, context, call_next):
+        result = await call_next(context)
+
+        # Tools can be in different shapes depending on transport/version
+        tools = None
+
+        # dict-like responses
+        if isinstance(result, dict):
+            if isinstance(result.get("tools"), list):
+                tools = result["tools"]
+            elif isinstance(result.get("result"), dict) and isinstance(result["result"].get("tools"), list):
+                tools = result["result"]["tools"]
+        else:
+            # object-like responses
+            tools = getattr(result, "tools", None)
+
+        if not isinstance(tools, list):
+            return result
+
+        for t in tools:
+            if isinstance(t, dict):
+                meta = t.get("_meta")
+                if not isinstance(meta, dict):
+                    meta = {}
+                    t["_meta"] = meta
+                meta["openai/visibility"] = "public"
+            else:
+                meta = getattr(t, "_meta", None)
+                if not isinstance(meta, dict):
+                    meta = {}
+                    setattr(t, "_meta", meta)
+                meta["openai/visibility"] = "public"
+
+        return result
+
+
+# ✅ Apply middleware at import time (required for FastMCP Cloud)
+mcp.add_middleware(ForceOpenAIPublicTools())
 
 
 def _get_oauth_access_token_str() -> str:
     token_obj = get_access_token()
 
-    # Common attribute names across versions
     for attr in ("token", "access_token", "value"):
         val = getattr(token_obj, attr, None)
         if isinstance(val, str) and val:
             return val
 
-    # Some versions may be dict-like
     try:
         val = token_obj.get("access_token")  # type: ignore[attr-defined]
         if isinstance(val, str) and val:
@@ -44,10 +95,7 @@ def _get_oauth_access_token_str() -> str:
     except Exception:
         pass
 
-    raise RuntimeError(
-        "Could not extract access token string from get_access_token(). "
-        "Inspect the AccessToken object to determine the correct attribute."
-    )
+    raise RuntimeError("Could not extract access token string from get_access_token().")
 
 
 def get_user_id(ctx: Context) -> str:
@@ -150,7 +198,6 @@ async def get_course_announcements(ctx: Context, course_id: str) -> str:
         return f"❌ Error fetching announcements: {str(e)}"
 
 
-# ✅ public as requested
 @mcp.tool(meta=OPENAI_PUBLIC_META, annotations={"readOnlyHint": True})
 async def debug_identity(ctx: Context) -> str:
     """Debug authentication and identity information."""
