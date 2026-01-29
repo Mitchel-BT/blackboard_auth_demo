@@ -1,4 +1,4 @@
-fastmcp>=3.0.0
+fastmcp
 httpx
 cryptography
 python-dotenv
