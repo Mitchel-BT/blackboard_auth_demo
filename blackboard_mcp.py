@@ -3,7 +3,7 @@ Blackboard MCP Tools with multi-tenant user identity
 """
 import os
 from fastmcp import FastMCP, Context
-from fastmcp.server.dependencies import get_token_claims
+from fastmcp.server.dependencies import get_access_token  # ⭐ This is the correct import
 from dotenv import load_dotenv
 from blackboard_client import BlackboardClient
 from auth import auth
@@ -17,21 +17,25 @@ mcp = FastMCP("Blackboard", auth=auth)
 
 def get_user_id(ctx: Context) -> str:
     """
-    Get the stable user identifier from OAuth claims.
-    This is the Blackboard user ID and persists across all sessions.
+    Get the stable user identifier from OAuth token claims.
+    Uses get_access_token() which returns an AccessToken object with .claims
     """
     try:
-        claims = get_token_claims()
-        user_id = claims.get("sub")
+        # get_access_token() returns an AccessToken object
+        token = get_access_token()
         
-        if not user_id:
-            raise ValueError("No user ID found in token claims")
+        # Access claims from the token
+        user_id = token.claims.get("sub")
         
-        logger.info(f"User ID from claims: {user_id}")
-        return user_id
+        if user_id:
+            logger.info(f"User ID from token claims: {user_id}")
+            return user_id
+        
+        logger.warning("No 'sub' claim found in token")
+        return ctx.session_id if ctx and ctx.session_id else "unknown"
+        
     except Exception as e:
-        logger.warning(f"Could not get user ID from claims: {e}")
-        # Fallback to session_id if needed
+        logger.error(f"Error getting user ID from token: {e}")
         return ctx.session_id if ctx and ctx.session_id else "unknown"
 
 @mcp.tool()
@@ -145,13 +149,14 @@ async def debug_identity(ctx: Context, access_token: str) -> str:
     user_id = get_user_id(ctx)
     session_id = ctx.session_id if ctx else None
     
-    # Get all OAuth claims
+    # Get all claims from token
     try:
-        claims = get_token_claims()
+        token = get_access_token()
+        claims = dict(token.claims)  # Convert to dict for display
         claims_list = [f"  {k}: {v}" for k, v in claims.items()]
         claims_info = "\n".join(claims_list)
     except Exception as e:
-        claims_info = f"  Error getting claims: {e}"
+        claims_info = f"Error getting claims: {e}"
     
     return f"""🔍 **Identity & Authentication Debug**
 
@@ -161,12 +166,12 @@ MULTI-TENANT USER IDENTIFIER (stable across sessions):
 MCP SESSION (may change between conversations):
   Session ID: {session_id[:16] if session_id else 'None'}...
   
-OAUTH CLAIMS (from token verification):
+OAUTH CLAIMS (from token.claims):
 {claims_info}
 
 ACCESS TOKEN:
   Has Token: {bool(access_token)}
-  Token Preview: {access_token[:8] if access_token else 'None'}...***
+  Token Preview: {access_token[:8] if access_token else 'None'}...
 
-💡 The Blackboard User ID is your stable identifier.
+💡 The Blackboard User ID (from claims['sub']) is your stable identifier.
    It persists across all Claude sessions and devices."""
