@@ -1,0 +1,5 @@
+fastmcp>=3.0.0
+httpx
+cryptography
+python-dotenv
+uvicorn
