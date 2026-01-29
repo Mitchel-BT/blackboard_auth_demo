@@ -3,14 +3,12 @@ Blackboard MCP Tools with multi-tenant user identity (Claude + OpenAI compatible
 
 - No access_token tool parameters.
 - Pull OAuth token via get_access_token().
-- Mark tools as public for OpenAI when supported via tool meta:
+- Explicitly mark tools public for OpenAI via tool _meta:
     {"openai/visibility": "public"}
-- Works even on older FastMCP versions that don't support meta/tags/annotations.
 """
 
 import os
 import logging
-import inspect
 from dotenv import load_dotenv
 
 from fastmcp import FastMCP, Context
@@ -24,49 +22,21 @@ logger = logging.getLogger(__name__)
 
 mcp = FastMCP("Blackboard", auth=auth)
 
+# OpenAI tool visibility lives on the tool descriptor _meta.
+# FastMCP exposes this as the `meta=` parameter on @mcp.tool(...). :contentReference[oaicite:2]{index=2}
 OPENAI_PUBLIC_META = {"openai/visibility": "public"}
-OPENAI_PRIVATE_META = {"openai/visibility": "private"}
-
-
-def _mcp_tool_kwargs(*, public: bool = True, read_only: bool = True) -> dict:
-    """
-    Build kwargs for @mcp.tool(...) in a version-tolerant way.
-    Older FastMCP versions may not accept meta=/tags=/annotations=.
-    """
-    sig = inspect.signature(mcp.tool)
-    params = sig.parameters
-
-    kwargs = {}
-
-    if "annotations" in params and read_only:
-        kwargs["annotations"] = {"readOnlyHint": True}
-
-    if "tags" in params:
-        kwargs["tags"] = {"public"} if public else {"internal"}
-
-    # OpenAI uses this for tool visibility in ChatGPT
-    if "meta" in params:
-        kwargs["meta"] = OPENAI_PUBLIC_META if public else OPENAI_PRIVATE_META
-
-    return kwargs
-
-
-def public_tool(*, read_only: bool = True):
-    return mcp.tool(**_mcp_tool_kwargs(public=True, read_only=read_only))
-
-
-def internal_tool(*, read_only: bool = True):
-    return mcp.tool(**_mcp_tool_kwargs(public=False, read_only=read_only))
 
 
 def _get_oauth_access_token_str() -> str:
     token_obj = get_access_token()
 
+    # Common attribute names across versions
     for attr in ("token", "access_token", "value"):
         val = getattr(token_obj, attr, None)
         if isinstance(val, str) and val:
             return val
 
+    # Some versions may be dict-like
     try:
         val = token_obj.get("access_token")  # type: ignore[attr-defined]
         if isinstance(val, str) and val:
@@ -106,8 +76,9 @@ def _client() -> BlackboardClient:
     )
 
 
-@public_tool(read_only=True)
+@mcp.tool(meta=OPENAI_PUBLIC_META, annotations={"readOnlyHint": True})
 async def get_my_courses(ctx: Context) -> str:
+    """Get all your enrolled Blackboard courses."""
     user_id = get_user_id(ctx)
     logger.info("get_my_courses called by user: %s", user_id)
 
@@ -129,8 +100,9 @@ async def get_my_courses(ctx: Context) -> str:
         return f"❌ Error fetching courses: {str(e)}"
 
 
-@public_tool(read_only=True)
+@mcp.tool(meta=OPENAI_PUBLIC_META, annotations={"readOnlyHint": True})
 async def get_my_grades(ctx: Context, course_id: str) -> str:
+    """Get your grades for a specific course."""
     user_id = get_user_id(ctx)
     logger.info("get_my_grades called by user: %s for course: %s", user_id, course_id)
 
@@ -152,8 +124,9 @@ async def get_my_grades(ctx: Context, course_id: str) -> str:
         return f"❌ Error fetching grades: {str(e)}"
 
 
-@public_tool(read_only=True)
+@mcp.tool(meta=OPENAI_PUBLIC_META, annotations={"readOnlyHint": True})
 async def get_course_announcements(ctx: Context, course_id: str) -> str:
+    """Get announcements for a specific course."""
     user_id = get_user_id(ctx)
     logger.info("get_course_announcements called by user: %s for course: %s", user_id, course_id)
 
@@ -177,9 +150,10 @@ async def get_course_announcements(ctx: Context, course_id: str) -> str:
         return f"❌ Error fetching announcements: {str(e)}"
 
 
-# ✅ NOW PUBLIC
-@public_tool(read_only=True)
+# ✅ public as requested
+@mcp.tool(meta=OPENAI_PUBLIC_META, annotations={"readOnlyHint": True})
 async def debug_identity(ctx: Context) -> str:
+    """Debug authentication and identity information."""
     user_id = get_user_id(ctx)
     session_id = getattr(ctx, "session_id", None)
 
