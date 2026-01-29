@@ -32,7 +32,7 @@ def _parse_scopes(env_value: str | None) -> list[str]:
 
 class BlackboardTokenVerifier(TokenVerifier):
     """
-    Verifies Blackboard tokens and extracts user identity.
+    Verifies Blackboard tokens by calling Blackboard /users/me.
     """
 
     def __init__(self, blackboard_url: str, required_scopes: Sequence[str] = ()):
@@ -61,7 +61,7 @@ class BlackboardTokenVerifier(TokenVerifier):
 
             logger.info("✅ Token verified for Blackboard user: %s", blackboard_user_id)
 
-            # IMPORTANT: include claims with a stable subject identifier.
+            # Include claims so downstream code can use claims['sub'] as stable user identifier.
             return AccessToken(
                 token=token,
                 client_id=blackboard_user_id,
