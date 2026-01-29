@@ -19,7 +19,8 @@ if not all([BLACKBOARD_URL, BLACKBOARD_APP_KEY, BLACKBOARD_APP_SECRET, SERVER_UR
     raise EnvironmentError("Missing required environment variables")
 
 from fastmcp.server.auth import OAuthProxy
-from fastmcp.server.auth.verifiers import TokenVerifier
+from fastmcp.server.auth.providers.bearer import TokenVerifier, AccessToken
+
 
 class BlackboardTokenVerifier(TokenVerifier):
     """
@@ -30,18 +31,10 @@ class BlackboardTokenVerifier(TokenVerifier):
     def __init__(self, blackboard_url: str):
         self.blackboard_url = blackboard_url.rstrip("/")
     
-    @property
-    def issuer(self) -> str:
-        return self.blackboard_url
-    
-    @property
-    def required_scopes(self) -> list[str]:
-        return ["read", "write", "offline"]
-    
-    async def verify_token(self, token: str) -> Optional[dict]:
+    async def verify_token(self, token: str) -> Optional[AccessToken]:
         """
         Verify token by calling Blackboard API and extract user identity.
-        Returns claims dict with 'sub' as the unique user identifier.
+        Returns AccessToken with user identity claims.
         """
         try:
             async with httpx.AsyncClient() as client:
@@ -62,14 +55,18 @@ class BlackboardTokenVerifier(TokenVerifier):
                     
                     logger.info(f"✅ Token verified for Blackboard user: {blackboard_user_id}")
                     
-                    # Return OAuth claims - 'sub' is the standard user identifier
-                    return {
-                        "sub": blackboard_user_id,  # PRIMARY USER IDENTIFIER
-                        "name": full_name or user_data.get("userName"),
-                        "email": user_data.get("contact", {}).get("email"),
-                        "userName": user_data.get("userName"),
-                        "scopes": ["read", "write", "offline"],
-                    }
+                    # Return AccessToken object instead of dict
+                    return AccessToken(
+                        token=token,
+                        client_id=blackboard_user_id,  # PRIMARY USER IDENTIFIER
+                        scopes=["read", "write", "offline"],
+                        claims={
+                            "sub": blackboard_user_id,
+                            "name": full_name or user_data.get("userName"),
+                            "email": user_data.get("contact", {}).get("email"),
+                            "userName": user_data.get("userName"),
+                        }
+                    )
                 
                 logger.warning(f"Token verification failed: HTTP {response.status_code}")
                 return None
@@ -77,6 +74,7 @@ class BlackboardTokenVerifier(TokenVerifier):
         except Exception as e:
             logger.error(f"Token verification error: {e}")
             return None
+
 
 # Create token verifier
 token_verifier = BlackboardTokenVerifier(blackboard_url=BLACKBOARD_URL)
