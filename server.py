@@ -350,8 +350,7 @@ mcp._extra_routes = [
 
 
 # =============================================================================
-# Entry Point
+# FastMCP Cloud Entry Point
 # =============================================================================
-
-if __name__ == "__main__":
-    mcp.run()
+# FastMCP Cloud imports this module and uses the `mcp` instance directly.
+# Entry point configuration: server:mcp
