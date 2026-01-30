@@ -2,13 +2,15 @@
 Blackboard MCP Server with Two-Stage Authentication
 
 Stage 1: FastMCP Cloud SSO (automatic - protects the server)
-Stage 2: Blackboard OAuth (per-session, auto-completing)
+Stage 2: Blackboard OAuth (per-session)
 """
 import os
 import secrets
 import httpx
 from datetime import datetime, timedelta
 from fastmcp import FastMCP, Context
+from starlette.routing import Route
+from starlette.responses import HTMLResponse, JSONResponse
 
 # =============================================================================
 # Configuration
@@ -28,6 +30,9 @@ _session_tokens: dict[str, dict] = {}
 
 # Maps auth_state -> {session_id, created_at} for pending OAuth flows
 _pending_auth: dict[str, dict] = {}
+
+# Maps session_id -> {sso_user_id, sso_email, first_seen, last_seen}
+_sso_identities: dict[str, dict] = {}
 
 # =============================================================================
 # Auth Helpers
@@ -128,6 +133,26 @@ async def exchange_code(code: str, state: str) -> dict:
     }
 
 
+def track_sso_identity(ctx: Context) -> None:
+    """Track SSO user identity from context."""
+    session_id = ctx.session_id
+    
+    # Extract SSO identity from context metadata if available
+    # FastMCP Cloud should provide user info in ctx.meta or similar
+    sso_user_id = getattr(ctx, 'user_id', None) or ctx.meta.get('user_id') if hasattr(ctx, 'meta') else None
+    sso_email = getattr(ctx, 'user_email', None) or ctx.meta.get('user_email') if hasattr(ctx, 'meta') else None
+    
+    if session_id not in _sso_identities:
+        _sso_identities[session_id] = {
+            "sso_user_id": sso_user_id,
+            "sso_email": sso_email,
+            "first_seen": datetime.utcnow(),
+            "last_seen": datetime.utcnow(),
+        }
+    else:
+        _sso_identities[session_id]["last_seen"] = datetime.utcnow()
+
+
 # =============================================================================
 # FastMCP Server
 # =============================================================================
@@ -136,126 +161,86 @@ mcp = FastMCP("Blackboard")
 
 
 @mcp.tool()
+async def whoami(ctx: Context) -> str:
+    """
+    Show your identity and authentication status.
+    
+    Displays:
+    - Your SSO identity (from FastMCP Cloud)
+    - Your session ID
+    - Your Blackboard connection status
+    """
+    track_sso_identity(ctx)
+    
+    session_id = ctx.session_id
+    sso_info = _sso_identities.get(session_id, {})
+    
+    # Build identity report
+    lines = ["🔍 **Your Identity**\n"]
+    
+    # SSO Identity (Stage 1 Auth)
+    lines.append("**FastMCP Cloud SSO:**")
+    if sso_info.get("sso_user_id"):
+        lines.append(f"  • User ID: {sso_info['sso_user_id']}")
+    if sso_info.get("sso_email"):
+        lines.append(f"  • Email: {sso_info['sso_email']}")
+    if not sso_info.get("sso_user_id") and not sso_info.get("sso_email"):
+        lines.append("  • No SSO identity found (check FastMCP Cloud auth)")
+    
+    # Session Info
+    lines.append(f"\n**Session:**")
+    lines.append(f"  • Session ID: {session_id}")
+    if sso_info.get("first_seen"):
+        lines.append(f"  • First seen: {sso_info['first_seen'].isoformat()}")
+    
+    # Blackboard Auth (Stage 2 Auth)
+    lines.append(f"\n**Blackboard Connection:**")
+    if is_authenticated(session_id):
+        bb_data = _session_tokens.get(session_id, {})
+        bb_user_id = bb_data.get("blackboard_user_id", "Unknown")
+        expires_at = bb_data.get("expires_at")
+        lines.append(f"  • Status: ✅ Connected")
+        lines.append(f"  • Blackboard User ID: {bb_user_id}")
+        if expires_at:
+            lines.append(f"  • Token expires: {expires_at.isoformat()}")
+    else:
+        lines.append(f"  • Status: ❌ Not connected")
+        lines.append(f"  • Use `blackboard_login` to connect")
+    
+    return "\n".join(lines)
+
+
+@mcp.tool()
 async def blackboard_login(ctx: Context) -> str:
     """
     Connect to your Blackboard account.
     
-    Opens a login window where you can securely sign in to Blackboard.
+    Returns a link to sign in to Blackboard. After signing in,
+    come back here and your tools will work.
     """
+    track_sso_identity(ctx)
     session_id = ctx.session_id
     
     # Already authenticated?
     if is_authenticated(session_id):
-        return "✅ You're already connected to Blackboard! Use `blackboard_status` to see details."
+        return "✅ You're already connected to Blackboard!"
     
     # Generate auth URL
     auth_url = get_auth_url(session_id)
-    poll_url = f"{SERVER_URL}/oauth/status/{session_id}"
     
-    # Return interactive HTML that opens popup and polls for completion
-    html = f'''<!DOCTYPE html>
-<html>
-<head>
-<style>
-* {{ box-sizing: border-box; font-family: system-ui, sans-serif; }}
-body {{ margin: 0; padding: 24px; background: #0f172a; color: white; min-height: 300px; }}
-.container {{ max-width: 400px; margin: 0 auto; text-align: center; }}
-h2 {{ margin: 0 0 8px; color: #38bdf8; }}
-p {{ color: #94a3b8; margin: 0 0 24px; }}
-.btn {{ 
-    display: inline-block; background: #3b82f6; color: white; 
-    padding: 14px 28px; border-radius: 8px; text-decoration: none;
-    font-weight: 600; font-size: 16px; border: none; cursor: pointer;
-}}
-.btn:hover {{ background: #2563eb; }}
-.status {{ 
-    margin-top: 24px; padding: 16px; border-radius: 8px;
-    background: #1e293b; color: #94a3b8;
-}}
-.status.success {{ background: #065f46; color: #6ee7b7; }}
-.status.error {{ background: #7f1d1d; color: #fca5a5; }}
-.spinner {{ display: inline-block; width: 16px; height: 16px; 
-    border: 2px solid #3b82f6; border-top-color: transparent;
-    border-radius: 50%; animation: spin 1s linear infinite; margin-right: 8px; }}
-@keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-</style>
-</head>
-<body>
-<div class="container">
-    <h2>🎓 Connect to Blackboard</h2>
-    <p>Sign in to access your courses, grades, and announcements.</p>
-    
-    <button class="btn" onclick="openLogin()">Sign in with Blackboard</button>
-    
-    <div id="status" class="status" style="display:none;"></div>
-</div>
+    return f"""🔐 **Connect to Blackboard**
 
-<script>
-let popup = null;
-let pollInterval = null;
+Click this link to sign in:
+{auth_url}
 
-function openLogin() {{
-    // Open popup
-    popup = window.open(
-        '{auth_url}',
-        'blackboard_login',
-        'width=500,height=600,menubar=no,toolbar=no'
-    );
-    
-    // Show waiting status
-    const status = document.getElementById('status');
-    status.style.display = 'block';
-    status.className = 'status';
-    status.innerHTML = '<span class="spinner"></span> Waiting for you to sign in...';
-    
-    // Poll for completion
-    pollInterval = setInterval(checkStatus, 2000);
-}}
-
-async function checkStatus() {{
-    try {{
-        const resp = await fetch('{poll_url}');
-        const data = await resp.json();
-        
-        if (data.status === 'authenticated') {{
-            clearInterval(pollInterval);
-            if (popup) popup.close();
-            
-            const status = document.getElementById('status');
-            status.className = 'status success';
-            status.innerHTML = '✅ Connected as <strong>' + data.username + '</strong>! You can now use Blackboard tools.';
-        }}
-    }} catch (e) {{
-        // Keep polling
-    }}
-}}
-
-// Clean up if popup closed manually
-setInterval(() => {{
-    if (popup && popup.closed && pollInterval) {{
-        clearInterval(pollInterval);
-        const status = document.getElementById('status');
-        if (!status.classList.contains('success')) {{
-            status.className = 'status';
-            status.innerHTML = 'Login window closed. <a href="#" onclick="openLogin(); return false;">Try again</a>';
-        }}
-    }}
-}}, 1000);
-</script>
-</body>
-</html>'''
-    
-    return {
-        "content": [
-            {"type": "text", "text": "👆 Click the button above to connect your Blackboard account."},
-            {"type": "resource", "resource": {"uri": "blackboard://login", "mimeType": "text/html", "text": html}}
-        ]
-    }
+After you authorize access, come back here and you'll be connected!"""
 
 
 @mcp.tool()
 async def blackboard_status(ctx: Context) -> str:
     """Check your Blackboard connection status."""
+    track_sso_identity(ctx)
+    
     if is_authenticated(ctx.session_id):
         data = _session_tokens.get(ctx.session_id, {})
         user_id = data.get("blackboard_user_id", "Unknown")
@@ -266,19 +251,16 @@ async def blackboard_status(ctx: Context) -> str:
 @mcp.tool()
 async def blackboard_logout(ctx: Context) -> str:
     """Disconnect from Blackboard."""
+    track_sso_identity(ctx)
+    
     if ctx.session_id in _session_tokens:
         del _session_tokens[ctx.session_id]
     return "✅ Disconnected from Blackboard."
 
 
 # =============================================================================
-# OAuth Callback Routes (added to FastMCP's HTTP server)
+# OAuth Callback Route
 # =============================================================================
-
-from starlette.routing import Route
-from starlette.responses import HTMLResponse, JSONResponse
-import asyncio
-
 
 async def oauth_callback(request):
     """Handle Blackboard OAuth callback."""
@@ -287,16 +269,29 @@ async def oauth_callback(request):
     error = request.query_params.get("error")
     
     if error:
-        return HTMLResponse(f'''
-            <html><body style="font-family:system-ui;background:#0f172a;color:white;
-                display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;">
-                <div style="text-align:center;max-width:400px;">
-                    <h2 style="color:#f87171;">❌ Authorization Failed</h2>
-                    <p>{error}</p>
-                    <p style="color:#64748b;">You can close this window and try again.</p>
-                </div>
-            </body></html>
-        ''', status_code=400)
+        return HTMLResponse(f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Authorization Failed</title>
+    <style>
+        body {{ font-family: system-ui, sans-serif; background: #0f172a; color: white;
+               display: flex; align-items: center; justify-content: center; 
+               min-height: 100vh; margin: 0; }}
+        .box {{ text-align: center; max-width: 400px; padding: 40px; }}
+        h1 {{ color: #f87171; }}
+        p {{ color: #94a3b8; }}
+    </style>
+</head>
+<body>
+    <div class="box">
+        <h1>❌ Authorization Failed</h1>
+        <p>{error}</p>
+        <p>You can close this window and try again in Claude.</p>
+    </div>
+</body>
+</html>
+        """, status_code=400)
     
     if not code or not state:
         return HTMLResponse("Missing code or state", status_code=400)
@@ -304,53 +299,62 @@ async def oauth_callback(request):
     try:
         result = await exchange_code(code, state)
         
-        return HTMLResponse(f'''
-            <html><body style="font-family:system-ui;background:#0f172a;color:white;
-                display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;">
-                <div style="text-align:center;max-width:400px;">
-                    <h2 style="color:#4ade80;">✅ Connected!</h2>
-                    <p>You're now connected to Blackboard.</p>
-                    <p style="color:#64748b;">This window will close automatically...</p>
-                </div>
-            </body></html>
-            <script>setTimeout(() => window.close(), 1500);</script>
-        ''')
+        return HTMLResponse("""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Connected!</title>
+    <style>
+        body { font-family: system-ui, sans-serif; background: #0f172a; color: white;
+               display: flex; align-items: center; justify-content: center; 
+               min-height: 100vh; margin: 0; }
+        .box { text-align: center; max-width: 400px; padding: 40px; }
+        h1 { color: #4ade80; }
+        p { color: #94a3b8; }
+    </style>
+</head>
+<body>
+    <div class="box">
+        <h1>✅ Connected to Blackboard!</h1>
+        <p>You can close this window and return to Claude.</p>
+        <p>Your Blackboard tools are now ready to use.</p>
+    </div>
+</body>
+</html>
+        """)
+        
     except Exception as e:
-        return HTMLResponse(f'''
-            <html><body style="font-family:system-ui;background:#0f172a;color:white;
-                display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;">
-                <div style="text-align:center;max-width:400px;">
-                    <h2 style="color:#f87171;">❌ Error</h2>
-                    <p>{str(e)}</p>
-                    <p style="color:#64748b;">Please close this window and try again.</p>
-                </div>
-            </body></html>
-        ''', status_code=400)
+        return HTMLResponse(f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Error</title>
+    <style>
+        body {{ font-family: system-ui, sans-serif; background: #0f172a; color: white;
+               display: flex; align-items: center; justify-content: center; 
+               min-height: 100vh; margin: 0; }}
+        .box {{ text-align: center; max-width: 400px; padding: 40px; }}
+        h1 {{ color: #f87171; }}
+        p {{ color: #94a3b8; }}
+    </style>
+</head>
+<body>
+    <div class="box">
+        <h1>❌ Error</h1>
+        <p>{str(e)}</p>
+        <p>Please close this window and try again.</p>
+    </div>
+</body>
+</html>
+        """, status_code=400)
 
 
-async def oauth_status(request):
-    """Poll endpoint for auth status."""
-    session_id = request.path_params.get("session_id")
-    
-    if is_authenticated(session_id):
-        data = _session_tokens.get(session_id, {})
-        return JSONResponse({
-            "status": "authenticated",
-            "username": data.get("blackboard_user_id", "Unknown"),
-        })
-    
-    return JSONResponse({"status": "pending"})
-
-
-# Add routes to FastMCP
+# Add OAuth route to FastMCP
 mcp._extra_routes = [
     Route("/oauth/callback", oauth_callback, methods=["GET"]),
-    Route("/oauth/status/{session_id}", oauth_status, methods=["GET"]),
 ]
-
 
 # =============================================================================
 # FastMCP Cloud Entry Point
 # =============================================================================
-# FastMCP Cloud imports this module and uses the `mcp` instance directly.
-# Entry point configuration: server:mcp
+# Entry point: server:mcp
