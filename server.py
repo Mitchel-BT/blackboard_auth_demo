@@ -7,6 +7,7 @@ Stage 2: Blackboard OAuth (per-session)
 import os
 import secrets
 import httpx
+import jwt
 from datetime import datetime, timedelta
 from fastmcp import FastMCP, Context
 from starlette.routing import Route
@@ -31,7 +32,8 @@ _session_tokens: dict[str, dict] = {}
 # Maps auth_state -> {session_id, created_at} for pending OAuth flows
 _pending_auth: dict[str, dict] = {}
 
-# Maps session_id -> {sso_user_id, sso_email, first_seen, last_seen}
+# Maps user_id -> {sso_user_id, sso_email, sso_name, session_ids[], first_seen, last_seen, raw_claims}
+# Falls back to session_id as key if no stable user_id is available
 _sso_identities: dict[str, dict] = {}
 
 # =============================================================================
@@ -133,24 +135,68 @@ async def exchange_code(code: str, state: str) -> dict:
     }
 
 
-def track_sso_identity(ctx: Context) -> None:
-    """Track SSO user identity from context."""
+def extract_jwt_claims(ctx: Context) -> dict:
+    """Extract user claims from JWT token in request headers."""
+    try:
+        # Try to get the Authorization header from the request
+        from fastmcp.server.context import request_ctx
+        
+        request_context = request_ctx.get()
+        if not request_context or not hasattr(request_context, 'request'):
+            return {}
+        
+        auth_header = request_context.request.headers.get("authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return {}
+        
+        token = auth_header.split(" ")[1]
+        
+        # Decode JWT without verification (since FastMCP Cloud already verified it)
+        import jwt
+        claims = jwt.decode(token, options={"verify_signature": False})
+        return claims
+        
+    except Exception as e:
+        print(f"Error extracting JWT claims: {e}")
+        return {}
+
+
+def track_sso_identity(ctx: Context) -> dict:
+    """
+    Track SSO user identity from JWT token.
+    Returns the extracted claims for immediate use.
+    """
     session_id = ctx.session_id
     
-    # Extract SSO identity from context metadata if available
-    # FastMCP Cloud should provide user info in ctx.meta or similar
-    sso_user_id = getattr(ctx, 'user_id', None) or ctx.meta.get('user_id') if hasattr(ctx, 'meta') else None
-    sso_email = getattr(ctx, 'user_email', None) or ctx.meta.get('user_email') if hasattr(ctx, 'meta') else None
+    # Extract claims from JWT
+    claims = extract_jwt_claims(ctx)
     
-    if session_id not in _sso_identities:
-        _sso_identities[session_id] = {
+    # Common JWT claim fields
+    sso_user_id = claims.get("sub") or claims.get("user_id") or claims.get("uid")
+    sso_email = claims.get("email")
+    sso_name = claims.get("name")
+    
+    # Store identity keyed by a stable identifier if available, otherwise use session_id
+    # Use the user_id from JWT as the stable key
+    storage_key = sso_user_id if sso_user_id else session_id
+    
+    if storage_key not in _sso_identities:
+        _sso_identities[storage_key] = {
             "sso_user_id": sso_user_id,
             "sso_email": sso_email,
+            "sso_name": sso_name,
+            "session_ids": [session_id],
             "first_seen": datetime.utcnow(),
             "last_seen": datetime.utcnow(),
+            "raw_claims": claims,
         }
     else:
-        _sso_identities[session_id]["last_seen"] = datetime.utcnow()
+        # Update last seen and add session_id if new
+        _sso_identities[storage_key]["last_seen"] = datetime.utcnow()
+        if session_id not in _sso_identities[storage_key]["session_ids"]:
+            _sso_identities[storage_key]["session_ids"].append(session_id)
+    
+    return claims
 
 
 # =============================================================================
@@ -170,10 +216,14 @@ async def whoami(ctx: Context) -> str:
     - Your session ID
     - Your Blackboard connection status
     """
-    track_sso_identity(ctx)
+    claims = track_sso_identity(ctx)
     
     session_id = ctx.session_id
-    sso_info = _sso_identities.get(session_id, {})
+    
+    # Find the user's identity record (may be keyed by user_id or session_id)
+    sso_user_id = claims.get("sub") or claims.get("user_id") or claims.get("uid")
+    storage_key = sso_user_id if sso_user_id else session_id
+    sso_info = _sso_identities.get(storage_key, {})
     
     # Build identity report
     lines = ["🔍 **Your Identity**\n"]
@@ -184,21 +234,46 @@ async def whoami(ctx: Context) -> str:
         lines.append(f"  • User ID: {sso_info['sso_user_id']}")
     if sso_info.get("sso_email"):
         lines.append(f"  • Email: {sso_info['sso_email']}")
+    if sso_info.get("sso_name"):
+        lines.append(f"  • Name: {sso_info['sso_name']}")
     if not sso_info.get("sso_user_id") and not sso_info.get("sso_email"):
-        lines.append("  • No SSO identity found (check FastMCP Cloud auth)")
+        lines.append("  • No SSO identity found")
+        lines.append("  • (This might mean JWT extraction failed)")
     
     # Session Info
     lines.append(f"\n**Session:**")
-    lines.append(f"  • Session ID: {session_id}")
+    lines.append(f"  • Current Session ID: {session_id}")
+    if sso_info.get("session_ids") and len(sso_info["session_ids"]) > 1:
+        lines.append(f"  • Total sessions for this user: {len(sso_info['session_ids'])}")
+        lines.append(f"  • Note: Session IDs may change between requests")
     if sso_info.get("first_seen"):
         lines.append(f"  • First seen: {sso_info['first_seen'].isoformat()}")
     
+    # Show raw JWT claims for debugging
+    if claims:
+        lines.append(f"\n**JWT Claims (for debugging):**")
+        for key, value in sorted(claims.items()):
+            if key not in ["exp", "iat", "nbf"]:  # Skip timestamps for clarity
+                lines.append(f"  • {key}: {value}")
+    
     # Blackboard Auth (Stage 2 Auth)
     lines.append(f"\n**Blackboard Connection:**")
-    if is_authenticated(session_id):
-        bb_data = _session_tokens.get(session_id, {})
-        bb_user_id = bb_data.get("blackboard_user_id", "Unknown")
-        expires_at = bb_data.get("expires_at")
+    
+    # Check if any of the user's sessions have Blackboard auth
+    blackboard_connected = False
+    bb_user_id = None
+    expires_at = None
+    
+    if sso_info.get("session_ids"):
+        for sid in sso_info["session_ids"]:
+            if is_authenticated(sid):
+                blackboard_connected = True
+                bb_data = _session_tokens.get(sid, {})
+                bb_user_id = bb_data.get("blackboard_user_id", "Unknown")
+                expires_at = bb_data.get("expires_at")
+                break
+    
+    if blackboard_connected:
         lines.append(f"  • Status: ✅ Connected")
         lines.append(f"  • Blackboard User ID: {bb_user_id}")
         if expires_at:
