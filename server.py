@@ -26,10 +26,11 @@ SERVER_URL = os.environ["SERVER_URL"].rstrip("/")
 # In-Memory Storage (session-scoped, multi-tenant safe)
 # =============================================================================
 
-# Maps session_id -> {access_token, expires_at, blackboard_user_id}
-_session_tokens: dict[str, dict] = {}
+# Maps sso_user_id -> {access_token, expires_at, blackboard_user_id, refresh_token (optional)}
+# Blackboard tokens are now linked to SSO user identity, not session
+_blackboard_tokens: dict[str, dict] = {}
 
-# Maps auth_state -> {session_id, created_at} for pending OAuth flows
+# Maps auth_state -> {sso_user_id, created_at} for pending OAuth flows
 _pending_auth: dict[str, dict] = {}
 
 # Maps user_id -> {sso_user_id, sso_email, sso_name, session_ids[], first_seen, last_seen, raw_claims}
@@ -40,38 +41,92 @@ _sso_identities: dict[str, dict] = {}
 # Auth Helpers
 # =============================================================================
 
-def get_session_token(session_id: str) -> str | None:
-    """Get Blackboard access token for a session, if valid."""
-    data = _session_tokens.get(session_id)
+def get_blackboard_token(sso_user_id: str) -> str | None:
+    """Get Blackboard access token for an SSO user, if valid."""
+    data = _blackboard_tokens.get(sso_user_id)
     if not data:
         return None
     
     # Check expiration
     if datetime.utcnow() >= data["expires_at"]:
-        del _session_tokens[session_id]
+        del _blackboard_tokens[sso_user_id]
         return None
     
     return data["access_token"]
 
 
-def is_authenticated(session_id: str) -> bool:
-    """Check if session has valid Blackboard auth."""
-    return get_session_token(session_id) is not None
+def is_blackboard_authenticated(sso_user_id: str) -> bool:
+    """Check if SSO user has valid Blackboard auth."""
+    return get_blackboard_token(sso_user_id) is not None
 
 
-def create_auth_state(session_id: str) -> str:
-    """Create a state token for OAuth flow, linked to session."""
+def get_sso_user_id_from_context(ctx: Context) -> str | None:
+    """Extract the stable SSO user ID from context."""
+    claims = extract_jwt_claims(ctx)
+    return claims.get("sub") or claims.get("user_id") or claims.get("uid")
+
+
+async def make_blackboard_api_call(
+    sso_user_id: str,
+    endpoint: str,
+    method: str = "GET",
+    data: dict | None = None,
+) -> dict:
+    """
+    Make an authenticated API call to Blackboard.
+    
+    Args:
+        sso_user_id: The SSO user ID (from JWT)
+        endpoint: API endpoint (e.g., "/learn/api/public/v1/courses")
+        method: HTTP method (GET, POST, PUT, DELETE)
+        data: Optional request body for POST/PUT
+    
+    Returns:
+        Response JSON
+    
+    Raises:
+        ValueError: If user is not authenticated to Blackboard
+        httpx.HTTPError: If the API call fails
+    """
+    access_token = get_blackboard_token(sso_user_id)
+    if not access_token:
+        raise ValueError("Not authenticated to Blackboard. Please use blackboard_login first.")
+    
+    url = f"{BLACKBOARD_URL}{endpoint}"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+    
+    async with httpx.AsyncClient() as client:
+        if method == "GET":
+            resp = await client.get(url, headers=headers, timeout=30.0)
+        elif method == "POST":
+            resp = await client.post(url, headers=headers, json=data, timeout=30.0)
+        elif method == "PUT":
+            resp = await client.put(url, headers=headers, json=data, timeout=30.0)
+        elif method == "DELETE":
+            resp = await client.delete(url, headers=headers, timeout=30.0)
+        else:
+            raise ValueError(f"Unsupported HTTP method: {method}")
+        
+        resp.raise_for_status()
+        return resp.json() if resp.text else {}
+
+
+def create_auth_state(sso_user_id: str) -> str:
+    """Create a state token for OAuth flow, linked to SSO user."""
     state = secrets.token_urlsafe(32)
     _pending_auth[state] = {
-        "session_id": session_id,
+        "sso_user_id": sso_user_id,
         "created_at": datetime.utcnow(),
     }
     return state
 
 
-def get_auth_url(session_id: str) -> str:
-    """Generate Blackboard OAuth URL for a session."""
-    state = create_auth_state(session_id)
+def get_auth_url(sso_user_id: str) -> str:
+    """Generate Blackboard OAuth URL for an SSO user."""
+    state = create_auth_state(sso_user_id)
     callback = f"{SERVER_URL}/oauth/callback"
     
     return (
@@ -87,7 +142,7 @@ def get_auth_url(session_id: str) -> str:
 async def exchange_code(code: str, state: str) -> dict:
     """
     Exchange authorization code for tokens.
-    Returns {session_id, access_token, user_id} on success.
+    Returns {sso_user_id, blackboard_user_id} on success (NO ACCESS TOKEN).
     Raises Exception on failure.
     """
     # Validate state
@@ -99,7 +154,7 @@ async def exchange_code(code: str, state: str) -> dict:
     if datetime.utcnow() - pending["created_at"] > timedelta(minutes=5):
         raise ValueError("Auth session expired")
     
-    session_id = pending["session_id"]
+    sso_user_id = pending["sso_user_id"]
     callback = f"{SERVER_URL}/oauth/callback"
     
     # Exchange code for tokens
@@ -120,18 +175,20 @@ async def exchange_code(code: str, state: str) -> dict:
         
         token_data = resp.json()
     
-    # Store token for session
+    # Store token linked to SSO user (NOT session)
     expires_in = token_data.get("expires_in", 3600)
-    _session_tokens[session_id] = {
+    _blackboard_tokens[sso_user_id] = {
         "access_token": token_data["access_token"],
         "expires_at": datetime.utcnow() + timedelta(seconds=expires_in),
         "blackboard_user_id": token_data.get("user_id"),
+        # Optionally store refresh token if Blackboard provides one
+        "refresh_token": token_data.get("refresh_token"),
     }
     
+    # IMPORTANT: Never return the access token to the user
     return {
-        "session_id": session_id,
-        "access_token": token_data["access_token"],
-        "user_id": token_data.get("user_id"),
+        "sso_user_id": sso_user_id,
+        "blackboard_user_id": token_data.get("user_id"),
     }
 
 
@@ -215,13 +272,15 @@ async def whoami(ctx: Context) -> str:
     - Your SSO identity (from FastMCP Cloud)
     - Your session ID
     - Your Blackboard connection status
+    
+    NOTE: Blackboard access tokens are NEVER shown to users.
     """
     claims = track_sso_identity(ctx)
     
     session_id = ctx.session_id
+    sso_user_id = get_sso_user_id_from_context(ctx)
     
-    # Find the user's identity record (may be keyed by user_id or session_id)
-    sso_user_id = claims.get("sub") or claims.get("user_id") or claims.get("uid")
+    # Find the user's identity record
     storage_key = sso_user_id if sso_user_id else session_id
     sso_info = _sso_identities.get(storage_key, {})
     
@@ -244,40 +303,23 @@ async def whoami(ctx: Context) -> str:
     lines.append(f"\n**Session:**")
     lines.append(f"  • Current Session ID: {session_id}")
     if sso_info.get("session_ids") and len(sso_info["session_ids"]) > 1:
-        lines.append(f"  • Total sessions for this user: {len(sso_info['session_ids'])}")
+        lines.append(f"  • Total sessions: {len(sso_info['session_ids'])}")
         lines.append(f"  • Note: Session IDs may change between requests")
     if sso_info.get("first_seen"):
         lines.append(f"  • First seen: {sso_info['first_seen'].isoformat()}")
     
-    # Show raw JWT claims for debugging
-    if claims:
-        lines.append(f"\n**JWT Claims (for debugging):**")
-        for key, value in sorted(claims.items()):
-            if key not in ["exp", "iat", "nbf"]:  # Skip timestamps for clarity
-                lines.append(f"  • {key}: {value}")
-    
     # Blackboard Auth (Stage 2 Auth)
     lines.append(f"\n**Blackboard Connection:**")
     
-    # Check if any of the user's sessions have Blackboard auth
-    blackboard_connected = False
-    bb_user_id = None
-    expires_at = None
-    
-    if sso_info.get("session_ids"):
-        for sid in sso_info["session_ids"]:
-            if is_authenticated(sid):
-                blackboard_connected = True
-                bb_data = _session_tokens.get(sid, {})
-                bb_user_id = bb_data.get("blackboard_user_id", "Unknown")
-                expires_at = bb_data.get("expires_at")
-                break
-    
-    if blackboard_connected:
+    if sso_user_id and is_blackboard_authenticated(sso_user_id):
+        bb_data = _blackboard_tokens.get(sso_user_id, {})
+        bb_user_id = bb_data.get("blackboard_user_id", "Unknown")
+        expires_at = bb_data.get("expires_at")
         lines.append(f"  • Status: ✅ Connected")
         lines.append(f"  • Blackboard User ID: {bb_user_id}")
         if expires_at:
             lines.append(f"  • Token expires: {expires_at.isoformat()}")
+        lines.append(f"  • 🔒 Access token secured (never exposed to user)")
     else:
         lines.append(f"  • Status: ❌ Not connected")
         lines.append(f"  • Use `blackboard_login` to connect")
@@ -294,32 +336,41 @@ async def blackboard_login(ctx: Context) -> str:
     come back here and your tools will work.
     """
     track_sso_identity(ctx)
-    session_id = ctx.session_id
+    sso_user_id = get_sso_user_id_from_context(ctx)
+    
+    if not sso_user_id:
+        return "❌ Unable to identify SSO user. Please try again."
     
     # Already authenticated?
-    if is_authenticated(session_id):
+    if is_blackboard_authenticated(sso_user_id):
         return "✅ You're already connected to Blackboard!"
     
     # Generate auth URL
-    auth_url = get_auth_url(session_id)
+    auth_url = get_auth_url(sso_user_id)
     
     return f"""🔐 **Connect to Blackboard**
 
 Click this link to sign in:
 {auth_url}
 
-After you authorize access, come back here and you'll be connected!"""
+After you authorize access, come back here and you'll be connected!
+
+Note: Your Blackboard credentials will be securely stored and linked to your SSO identity ({sso_user_id})."""
 
 
 @mcp.tool()
 async def blackboard_status(ctx: Context) -> str:
     """Check your Blackboard connection status."""
     track_sso_identity(ctx)
+    sso_user_id = get_sso_user_id_from_context(ctx)
     
-    if is_authenticated(ctx.session_id):
-        data = _session_tokens.get(ctx.session_id, {})
-        user_id = data.get("blackboard_user_id", "Unknown")
-        return f"✅ Connected to Blackboard (User ID: {user_id})"
+    if not sso_user_id:
+        return "❌ Unable to identify SSO user."
+    
+    if is_blackboard_authenticated(sso_user_id):
+        data = _blackboard_tokens.get(sso_user_id, {})
+        bb_user_id = data.get("blackboard_user_id", "Unknown")
+        return f"✅ Connected to Blackboard (User ID: {bb_user_id})\n🔒 Access token secured"
     return "❌ Not connected. Use `blackboard_login` to connect."
 
 
@@ -327,10 +378,58 @@ async def blackboard_status(ctx: Context) -> str:
 async def blackboard_logout(ctx: Context) -> str:
     """Disconnect from Blackboard."""
     track_sso_identity(ctx)
+    sso_user_id = get_sso_user_id_from_context(ctx)
     
-    if ctx.session_id in _session_tokens:
-        del _session_tokens[ctx.session_id]
-    return "✅ Disconnected from Blackboard."
+    if not sso_user_id:
+        return "❌ Unable to identify SSO user."
+    
+    if sso_user_id in _blackboard_tokens:
+        del _blackboard_tokens[sso_user_id]
+        return "✅ Disconnected from Blackboard. Your access token has been securely removed."
+    return "ℹ️ You weren't connected to Blackboard."
+
+
+@mcp.tool()
+async def get_blackboard_courses(ctx: Context) -> str:
+    """
+    Get a list of your Blackboard courses.
+    
+    This is an example tool that demonstrates how to make authenticated
+    Blackboard API calls without exposing access tokens.
+    """
+    track_sso_identity(ctx)
+    sso_user_id = get_sso_user_id_from_context(ctx)
+    
+    if not sso_user_id:
+        return "❌ Unable to identify SSO user."
+    
+    try:
+        # Make authenticated API call (token handled internally)
+        courses = await make_blackboard_api_call(
+            sso_user_id,
+            "/learn/api/public/v1/courses",
+            method="GET"
+        )
+        
+        # Format response
+        if not courses or "results" not in courses:
+            return "No courses found."
+        
+        lines = ["📚 **Your Blackboard Courses**\n"]
+        for course in courses["results"][:10]:  # Limit to 10 courses
+            course_id = course.get("id", "Unknown")
+            course_name = course.get("name", "Unnamed Course")
+            lines.append(f"  • {course_name} (ID: {course_id})")
+        
+        if len(courses["results"]) > 10:
+            lines.append(f"\n... and {len(courses['results']) - 10} more courses")
+        
+        return "\n".join(lines)
+        
+    except ValueError as e:
+        return f"❌ {str(e)}"
+    except Exception as e:
+        return f"❌ Error fetching courses: {str(e)}"
 
 
 # =============================================================================
